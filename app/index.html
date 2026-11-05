@@ -910,12 +910,39 @@ const U = {
     ready: { label: 'готовое из магазина', short: 'готовое', color: 'var(--s4)' },
     squash: { label: 'добавка в день сквоша', short: 'добавка', color: 'var(--s2)' },
   };
-  const WD_SUN = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
+  const WD_SUN = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];   // по Date.getUTCDay(); первый день недели меню — день недели поля start
   let NT = null;
   function ntLoad() {
     try { const raw = localStorage.getItem(NT_KEY); if (raw) { const o = JSON.parse(raw); if (o && typeof o === 'object') NT = o; } } catch (e) { /* нет хранилища */ }
     if (!NT) NT = { v: 1, data: null, marks: {}, updatedAt: null };
     NT.marks = NT.marks || {};
+    ntMigrateLocal();
+  }
+  // Отметки «куплено / приготовлено» привязаны к началу недели меню (дата в ключе).
+  // Переход недели Вс–Сб → Пн–Вс (31.10.2026): ключи с датой дня заготовки (за день до начала недели меню)
+  // переносятся на начало недели. Повторный запуск ничего не меняет: при новом start таких ключей не бывает.
+  function ntMigrateMarks(marks) {
+    const N = NT && NT.data;
+    if (!N || !N.start || !marks) return marks;
+    const s0 = Date.parse(N.start + 'T00:00:00Z');
+    let out = null;
+    for (const [k, v] of Object.entries(marks)) {
+      const m = /^(buy|cook)\|(\d{4}-\d{2}-\d{2})\|(.*)$/s.exec(k);
+      if (!m) continue;
+      const t = Date.parse(m[2] + 'T00:00:00Z');
+      if (Number.isNaN(t) || ((((t - s0) / 86400000) % 7) + 7) % 7 !== 6) continue;   // не день заготовки
+      out = out || { ...marks };
+      const nk = `${m[1]}|${new Date(t + 86400000).toISOString().slice(0, 10)}|${m[3]}`;
+      const cur = out[nk];
+      if (!cur || (v.at || '') > (cur.at || '')) out[nk] = v;
+      delete out[k];
+    }
+    return out || marks;
+  }
+  function ntMigrateLocal() {
+    const m = ntMigrateMarks(NT.marks);
+    if (m !== NT.marks) { NT.marks = m; try { localStorage.setItem(NT_KEY, JSON.stringify(NT)); } catch (e) { /* нет хранилища */ } return true; }
+    return false;
   }
   function ntSave(silent) {
     NT.updatedAt = new Date().toISOString();
@@ -931,6 +958,7 @@ const U = {
     const n = obj.nutrition;
     if (!n || !n.start || !Array.isArray(n.weeks) || !n.recipes || !n.products || !Array.isArray(n.people)) throw new Error('В файле нет меню (start, weeks, recipes, products, people)');
     NT.data = { ...n, mt: new Date().toISOString() };
+    NT.marks = ntMigrateMarks(NT.marks);
     ntSave();
     const nr = Object.keys(n.recipes).length;
     return `меню «${n.name || 'без названия'}»: ${n.weeks.length} нед. по кругу с ${fmtDate(U.dayMs(n.start))}, рецептов ${nr}, людей ${n.people.length}; отметки сохранены`;
@@ -944,7 +972,8 @@ const U = {
     return { v: 1, data, marks, updatedAt: (a.updatedAt || '') >= (b.updatedAt || '') ? a.updatedAt : b.updatedAt };
   }
 
-  /* ---------------- календарь меню: неделя начинается в воскресенье (день заготовки) */
+  /* ---------------- календарь меню: неделя начинается в день недели поля start (с 31.10.2026 — понедельник);
+     закупка и заготовка — накануне (день заготовки = начало недели − 1 день) */
   const ntStart = () => U.dayMs(NTD().start);
   // Первый день питания по меню (поле firstDay, необязательное): до него меню пустое, закупка и порции заготовки — без этих дней
   const ntFirst = () => (NTD().firstDay ? Math.max(U.dayMs(NTD().firstDay), ntStart()) : ntStart());
@@ -953,9 +982,33 @@ const U = {
   const ntWeekStart = (w) => ntStart() + w * 7 * DAY;
   const ntMenuIdx = (w) => ((w % ntCycle()) + ntCycle()) % ntCycle();              // 0..cycle-1
   const ntToday = () => { const n = new Date(); return Date.UTC(n.getFullYear(), n.getMonth(), n.getDate()); };
+  const ntCookDay = (w) => ntWeekStart(w) - DAY;                                    // день закупки и заготовки на неделю w
+  // Разовые замены по датам (поле overrides, необязательное): { "ГГГГ-ММ-ДД": { L, D, ..., src: {...}, note } }
+  const ntOverride = (t) => ((NTD().overrides || {})[U.msToDate(t)]) || null;
   function ntDay(t) {
     const w = ntWeekNo(t), idx = ntMenuIdx(w), dow = Math.round((t - ntWeekStart(w)) / DAY);
-    return { t, w, idx, dow, wd: WD_SUN[dow], day: NTD().weeks[idx].days[dow], before: t < ntFirst() };
+    const base = NTD().weeks[idx].days[dow], ov = ntOverride(t);
+    const day = ov ? { ...base, ...ov, src: { ...(base.src || {}), ...(ov.src || {}) } } : base;
+    return { t, w, idx, dow, wd: WD_SUN[new Date(t).getUTCDay()], day, base, ov, before: t < ntFirst() };
+  }
+  // Неделя заготовки, к которой относится блюдо приёма пищи: обычно неделя дня; замена в день заготовки блюдом
+  // следующей недели (переход 01.11.2026: ужин — 2Г из заготовки этого дня) — следующая неделя.
+  function ntBatchWeekOf(t, rid) {
+    const w = ntWeekNo(t), info = ntDay(t);
+    if (t === ntCookDay(w + 1) && info.ov && info.base && rid !== info.base.L && rid !== info.base.D) {
+      const b = (NTD().batch || []).find(x => x.week === ntMenuIdx(w + 1) + 1);
+      if (b && b.dishes.some(d => d.r === rid)) return w + 1;
+    }
+    return w;
+  }
+  // Приёмы пищи, относящиеся к неделе w (закупка и заготовка): дни недели + замены в день заготовки накануне
+  function ntWeekMeals(w, p) {
+    const out = [];
+    for (let d = -1; d < 7; d++) {
+      const t = ntWeekStart(w) + d * DAY;
+      for (const m of ntMeals(t, p)) if (ntBatchWeekOf(t, m.rid) === w) out.push({ t, m });
+    }
+    return out;
   }
   // День сквоша: по трекеру тренировок (если дата в его периоде), иначе — по типовой неделе меню
   function ntSquash(t) {
@@ -1020,16 +1073,13 @@ const U = {
     return Math.abs(val - tg.v) <= tg.v * (tg.tol != null ? tg.tol : 0.05) ? 'good' : 'bad';
   }
 
-  /* ---------------- закупка и заготовка на неделю (Вс–Сб), на всех людей */
+  /* ---------------- закупка и заготовка на неделю меню, на всех людей */
   function ntShopping(w) {
     const items = {}; let ready = 0;
-    for (let d = 0; d < 7; d++) {
-      const t = ntWeekStart(w) + d * DAY;
-      for (const p of NTD().people) for (const m of ntMeals(t, p)) {
-        const r = NTD().recipes[m.rid];
-        if (r && r.kind === 'ready') { ready++; continue; }
-        for (const { prod, g } of ntPortion(m.rid, p)) items[prod] = (items[prod] || 0) + g;
-      }
+    for (const p of NTD().people) for (const { m } of ntWeekMeals(w, p)) {
+      const r = NTD().recipes[m.rid];
+      if (r && r.kind === 'ready') { ready++; continue; }
+      for (const { prod, g } of ntPortion(m.rid, p)) items[prod] = (items[prod] || 0) + g;
     }
     return { items, ready };
   }
@@ -1040,18 +1090,23 @@ const U = {
     if (!b) return null;
     const people = NTD().people;
     const sumF = people.reduce((a, p) => a + p.factor, 0);
-    const ws = ntWeekStart(w), first = ntFirst(), cut = ws < first;
-    // неделя, в которой начинается меню: порции — только по дням с первого дня питания
-    const eat = (rid) => { let n = 0, sun = false; for (let d = 0; d < 7; d++) { const dd = NTD().weeks[idx].days[d]; if (ws + d * DAY >= first && (dd.L === rid || dd.D === rid)) { n++; if (d === 0) sun = true; } } return { n, sun }; };
+    const cook = ntCookDay(w), p0 = people[0];
+    // порции = приёмы пищи этого блюда в неделе (с первого дня питания и с заменами по датам);
+    // съеденное в день заготовки — горячим, без контейнера
+    const meals = ntWeekMeals(w, p0);
+    const eat = (rid) => { const ts = meals.filter(x => x.m.rid === rid && x.m.slot !== 'X').map(x => x.t); return { n: ts.length, onCook: ts.filter(t => t === cook).length }; };
     const dishes = b.dishes.map(dsh0 => {
-      let dsh = dsh0;
-      if (cut) { const e = eat(dsh0.r); dsh = { ...dsh0, days: e.n, use: !e.sun && dsh0.use.startsWith('ужин Вс') ? dsh0.use.replace(/^ужин Вс, /, 'ужин ').replace(/^ужин Вс–/, 'ужин Пн–') : dsh0.use }; }
+      const e = eat(dsh0.r);
+      let use = dsh0.use;
+      if (e.onCook) use = `${use.split(' ')[0]} ${fmtDate(cook).slice(0, 5)} (в день заготовки), ${use.split(' ').slice(1).join(' ')}`;
+      else if (e.n !== dsh0.days) use = `${use} — ${e.n} порц. по меню`;
+      const dsh = { ...dsh0, days: e.n, use, onCook: e.onCook };
       const r = NTD().recipes[dsh.r];
       const ingr = (r.ingr || []).map(([prod, g, only]) => {
         const eaters = people.filter(p => !only || only === p.id);
         return { prod, g, only, total: g * eaters.reduce((a, p) => a + p.factor, 0) * dsh.days };
       });
-      const shares = people.map(p => ({ id: p.id, name: p.name, share: p.factor / sumF, containers: dsh.days - (dsh.where === 'fridge' && dsh.use.startsWith('ужин Вс') ? 1 : 0) }));
+      const shares = people.map(p => ({ id: p.id, name: p.name, share: p.factor / sumF, containers: dsh.days - dsh.onCook }));
       return { ...dsh, recipe: r, ingr, shares };
     });
     return { ...b, dishes };
@@ -1070,8 +1125,8 @@ const U = {
     return list.sort((a, b) => a.cat.localeCompare(b.cat) || a.prod.localeCompare(b.prod));
   }
   const ntStores = (list) => [...new Set(list.map(x => x.store))].sort((a, b) => (STORE_ORDER.indexOf(a) + 1 || 99) - (STORE_ORDER.indexOf(b) + 1 || 99));
-  // Неделя закупки: в субботу — следующая (закупка к воскресной заготовке), иначе текущая
-  const ntBuyWeek = () => { const t = ntToday(); if (t < ntStart()) return 0; const w = ntWeekNo(t); return ntDay(t).dow === 6 ? w + 1 : w; };
+  // Неделя закупки и заготовки: за 2 последних дня недели меню (Сб и Вс при неделе Пн–Вс) — следующая, иначе текущая
+  const ntBuyWeek = () => { const t = ntToday(); if (t < ntStart() - 2 * DAY) return 0; const w = ntWeekNo(t); return t >= ntWeekStart(w + 1) - 2 * DAY ? w + 1 : Math.max(0, w); };
   const markKey = (type, w, id) => `${type}|${U.msToDate(ntWeekStart(w))}|${id}`;
   const isMarked = (key) => !!(NT.marks[key] && NT.marks[key].on);
   function setMark(key, on) { NT.marks[key] = { on: !!on, at: new Date().toISOString() }; ntSave(); }
@@ -1485,7 +1540,7 @@ const U = {
       await withRetry(async () => {
         const doc = await getDoc('shared/marks');
         const rk = (await unpack(doc)) || {};
-        const merged = mergeNutrition({ data: 1, marks: NT.marks }, { data: 1, marks: rk }).marks;
+        const merged = ntMigrateMarks(mergeNutrition({ data: 1, marks: NT.marks }, { data: 1, marks: rk }).marks);   // перенос ключей на начало недели меню (переход на Пн–Вс)
         if (canon(merged) !== canon(NT.marks)) { NT.marks = merged; ntSave(true); changed = true; }
         if (canon(merged) !== canon(rk)) await commit([{ update: { name: docName('shared/marks'), fields: await pack(merged) }, currentDocument: pre(doc) }]);
       });
@@ -1555,7 +1610,7 @@ const U = {
     /* ---------------- версия сайта */
     // build.py подставляет в BUILD дату и время сборки и кладёт то же значение в web/version.json.
     // В исходнике dashboard.html метка остаётся как есть — показываем «исходник».
-    const BUILD = '2026-10-28 12:26';
+    const BUILD = '2026-10-31 09:52';
     const isBuilt = !BUILD.startsWith('__');
     const buildLabel = isBuilt ? BUILD : 'исходник';
     const verUrl = /\/app\/?(index\.html)?$/.test(location.pathname) ? '../version.json' : 'version.json';
@@ -2196,8 +2251,8 @@ const U = {
     const w = ntWeekNo(t0), ws = ntWeekStart(w);
     const wl = h('div', 'tmr');
     for (let d = 0; d < 7; d++) {
-      const td = ws + d * DAY, dd = ntDay(td).day;
-      const row = h('div'); row.appendChild(h('span', null, `${WD_SUN[d]} ${dm(td)}`));
+      const td = ws + d * DAY, di = ntDay(td), dd = di.day;
+      const row = h('div'); row.appendChild(h('span', null, `${di.wd} ${dm(td)}`));
       row.appendChild(h('span', null, `${(N.recipes[dd.L] || {}).name || dd.L} / ${(N.recipes[dd.D] || {}).name || dd.D}`));
       wl.appendChild(row);
     }
@@ -2218,7 +2273,7 @@ const U = {
     next.onclick = () => { buyW++; render(); };
     const tt = h('div', 'wk-t');
     tt.appendChild(h('b', null, `${dm(t0)} — ${dm(t0 + 6 * DAY)}`));
-    tt.appendChild(h('span', 'muted small', `неделя меню ${ntMenuIdx(w) + 1}${w === ntBuyWeek() ? ' · к этой закупке' : ''}`));
+    tt.appendChild(h('span', 'muted small', `неделя меню ${ntMenuIdx(w) + 1} · закупка ${WD_SUN[new Date(ntCookDay(w)).getUTCDay()]} ${dm(ntCookDay(w))}${w === ntBuyWeek() ? ' · ближайшая' : ''}`));
     head.appendChild(prev); head.appendChild(tt); head.appendChild(next);
     view.appendChild(head);
     const list = ntBuyList(w);
@@ -2233,7 +2288,7 @@ const U = {
     hb.onclick = () => { buyHide = !buyHide; render(); };
     tools.appendChild(hb);
     top.appendChild(tools);
-    top.appendChild(h('div', 'muted small', `Количество на двоих, с запасом ${Math.round((NTD().waste || 0) * 100)} % на отходы. Отметки видны на сайте и у всех, кто синхронизирован.`));
+    top.appendChild(h('div', 'muted small', `Количество по меню на неделю, с запасом ${Math.round((NTD().waste || 0) * 100)} % на отходы. Отметки видны на сайте и у всех, кто синхронизирован.`));
     view.appendChild(top);
     if (buyHide && done === list.length && list.length) { view.appendChild(h('div', 'buy-done', 'Всё куплено ✓')); return; }
     for (const st of ntStores(list)) {
