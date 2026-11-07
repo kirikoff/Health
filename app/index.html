@@ -909,6 +909,7 @@ const U = {
     freezer: { label: 'заготовка, морозилка', short: 'морозилка', color: 'var(--s7)' },
     ready: { label: 'готовое из магазина', short: 'готовое', color: 'var(--s4)' },
     squash: { label: 'добавка в день сквоша', short: 'добавка', color: 'var(--s2)' },
+    leftover: { label: 'остатки прошлой заготовки (не покупать)', short: 'остатки', color: 'var(--s5)' },
   };
   const WD_SUN = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];   // по Date.getUTCDay(); первый день недели меню — день недели поля start
   let NT = null;
@@ -1077,6 +1078,7 @@ const U = {
   function ntShopping(w) {
     const items = {}; let ready = 0;
     for (const p of NTD().people) for (const { m } of ntWeekMeals(w, p)) {
+      if (m.src === 'leftover') continue;   // доедаем приготовленное раньше — в закупку не идёт
       const r = NTD().recipes[m.rid];
       if (r && r.kind === 'ready') { ready++; continue; }
       for (const { prod, g } of ntPortion(m.rid, p)) items[prod] = (items[prod] || 0) + g;
@@ -1095,7 +1097,10 @@ const U = {
     // съеденное в день заготовки — горячим, без контейнера
     const meals = ntWeekMeals(w, p0);
     const eat = (rid) => { const ts = meals.filter(x => x.m.rid === rid && x.m.slot !== 'X').map(x => x.t); return { n: ts.length, onCook: ts.filter(t => t === cook).length }; };
-    const dishes = b.dishes.map(dsh0 => {
+    // Поправки заготовки на конкретную неделю (поле batchOverrides, необязательное): { "ГГГГ-ММ-ДД начала недели": { "1Г": { where, use, days } } }
+    const bo = (NTD().batchOverrides || {})[U.msToDate(ntWeekStart(w))] || {};
+    const dishes = b.dishes.map(d0 => {
+      const dsh0 = { ...d0, ...(bo[d0.r] || {}) };
       const e = eat(dsh0.r);
       let use = dsh0.use;
       if (e.onCook) use = `${use.split(' ')[0]} ${fmtDate(cook).slice(0, 5)} (в день заготовки), ${use.split(' ').slice(1).join(' ')}`;
@@ -1610,7 +1615,7 @@ const U = {
     /* ---------------- версия сайта */
     // build.py подставляет в BUILD дату и время сборки и кладёт то же значение в web/version.json.
     // В исходнике dashboard.html метка остаётся как есть — показываем «исходник».
-    const BUILD = '2026-10-31 09:52';
+    const BUILD = '2026-11-07 13:05';
     const isBuilt = !BUILD.startsWith('__');
     const buildLabel = isBuilt ? BUILD : 'исходник';
     const verUrl = /\/app\/?(index\.html)?$/.test(location.pathname) ? '../version.json' : 'version.json';
