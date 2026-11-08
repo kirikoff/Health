@@ -484,7 +484,8 @@ footer.foot { color: var(--muted); font-size: 12px; padding: 24px max(16px, calc
       <h2>Загрузите выгрузки</h2>
       <p>Файлы разбираются прямо в браузере. На сайте после входа (кнопка «Войти» вверху) разобранные данные синхронизируются между устройствами; локальный файл работает без интернета и ничего не отправляет. Можно загружать всё сразу, в любом порядке — тип файла определится сам. Исходные выгрузки лежат в папке <b>raw</b>.</p>
       <ol>
-        <li><b>Garmin</b> (raw\garmin) — полный экспорт аккаунта: garmin.com/account/datamanagement → «Экспорт данных». Ссылка на ZIP придёт на почту через 24–48 часов. Загружайте ZIP целиком, распаковывать не нужно.</li>
+        <li><b>Garmin, ежедневно</b> (raw\garmin\api) — файл garmin_api_ГГГГ-ММ-ДД.json, его делает скрипт src\garmin_pull.py по расписанию: HRV, сон, Body Battery, шаги, тренировки за 14 дней. Загружайте самый свежий.</li>
+        <li><b>Garmin, раз в месяц</b> (raw\garmin) — полный экспорт аккаунта: garmin.com/account/datamanagement → «Экспорт данных». Ссылка на ZIP придёт на почту через 24–48 часов. Нужен ради готовности, статуса тренированности, VO2max и границ базового диапазона HRV — через API их нет. Загружайте ZIP целиком, распаковывать не нужно.</li>
         <li><b>Picooc</b> (raw\picooc) — в приложении экспорт истории измерений: файл весов и файл давления.</li>
         <li><b>Анализы</b> — шаблон <b>raw\labs\labs.xlsx</b>: впишите значения и загрузите.</li>
         <li><b>План тренировок</b> — <b>training\plan.json</b>: один раз, дальше он хранится в ваших данных.</li>
@@ -916,6 +917,87 @@ const Parsers = (() => {
     return { kind: 'garmin', days, activities };
   }
 
+  /* ----------------------------------------------------------- Garmin Personal API (src\garmin_pull.py) */
+  // Файл garmin_api_ГГГГ-ММ-ДД.json: ответы API как есть. Единицы API: длительность — с, дистанция — м.
+  // Готовности, статуса тренированности, VO2max и нагрузки Garmin (acute/chronic) в API нет — они только из полного экспорта.
+  function parseGarminApi(obj) {
+    const days = {};
+    const day = (d) => (days[d] = days[d] || {});
+    // HRV: значение ночи. Базовый диапазон ночи (healthStatus) API не отдаёт — статус считает enrichDaily по границам из экспорта
+    for (const r of obj.hrv || []) {
+      const d = r.calendarDate; if (!d || r.lastNightAvg == null) continue;
+      const o = day(d), b = r.baseline || {};
+      o.hrv = U.pos(r.lastNightAvg);
+      o.hrvBalLow = U.pos(b.balancedLow);     // диапазон недельного статуса HRV — не тот, что в экспорте (healthStatus шире)
+      o.hrvBalHigh = U.pos(b.balancedUpper);
+      o.hrvWeekly = U.pos(r.weeklyAvg);
+    }
+    for (const r of obj.sleep || []) {
+      const d = r.calendarDate, sc = r.sleepScores && r.sleepScores.overall;
+      if (!d || !sc) continue;
+      const o = day(d);
+      const deep = r.deepSleepSeconds || 0, light = r.lightSleepSeconds || 0, rem = r.remSleepSeconds || 0;
+      o.sleepScore = U.pos(sc.value);
+      o.sleepMin = Math.round((deep + light + rem) / 60);
+      o.deepMin = Math.round(deep / 60);
+      o.remMin = Math.round(rem / 60);
+      o.lightMin = Math.round(light / 60);
+      o.awakeMin = Math.round((r.awakeSleepSeconds || 0) / 60);
+    }
+    for (const r of obj.daily || []) {
+      const d = r.calendarDate; if (!d) continue;
+      const o = day(d), hr = r.heartRate || {}, mv = (r.movement || {}).steps || {}, im = r.intensityMinutes || {}, st = r.stress || {}, bb = r.bodyBattery || {};
+      o.rhrDay = U.pos(hr.restingValue);   // пульс покоя за сутки; в экспорте rhr — среднее за 7 дней, его досчитывает enrichDaily
+      o.steps = U.num(mv.value);
+      o.imMod = U.num(im.moderate);
+      o.imVig = U.num(im.vigorous);
+      o.stress = U.pos(st.avgLevel);
+      o.stressMax = U.pos(st.maxLevel);
+      o.bbMax = U.num(bb.maxValue);
+      o.bbMin = U.num(bb.minValue);
+      o.bbCharged = U.num(bb.chargedValue);
+      o.bbDrained = U.num(bb.drainedValue);
+      o.spo2 = U.pos((r.pulseOx || {}).avgValue);
+    }
+    // Body Battery из отдельного отчёта — если в суточной сводке его нет
+    for (const r of obj.bb || []) {
+      const d = r.date; if (!d) continue;
+      const vals = (r.bodyBatteryValuesArray || []).map(v => v && v[1]).filter(v => typeof v === 'number');
+      const o = day(d);
+      if (o.bbMax == null && vals.length) { o.bbMax = Math.max(...vals); o.bbMin = Math.min(...vals); }
+      if (o.bbCharged == null) o.bbCharged = U.num(r.charged);
+      if (o.bbDrained == null) o.bbDrained = U.num(r.drained);
+    }
+    const activities = {};
+    for (const a of obj.activities || []) {
+      const w = U.when(a.startTimeLocal);
+      if (!w || a.activityId == null) continue;
+      activities[a.activityId] = {
+        id: a.activityId,
+        date: w.date,
+        t: w.t,
+        type: (a.activityType && a.activityType.typeKey) || 'other',
+        name: a.activityName || '',
+        durMin: a.duration != null ? Math.round(a.duration / 0.6) / 100 : null,
+        distKm: a.distance ? Math.round(a.distance / 10) / 100 : null,
+        avgHr: U.pos(a.averageHR),
+        maxHr: U.pos(a.maxHR),
+        kcal: a.calories != null ? Math.round(a.calories) : null,
+        aerobicTE: U.num(a.aerobicTrainingEffect),
+        anaerobicTE: U.num(a.anaerobicTrainingEffect),
+        teLabel: a.trainingEffectLabel || null,
+        load: a.activityTrainingLoad != null ? Math.round(a.activityTrainingLoad) : null,
+        rpe: U.num(a.workoutRpe),
+      };
+    }
+    // в днях оставляем только заполненные поля: файл API дополняет день, а не заменяет его
+    for (const d of Object.keys(days)) {
+      for (const k of Object.keys(days[d])) if (days[d][k] === null || days[d][k] === undefined) delete days[d][k];
+      if (!Object.keys(days[d]).length) delete days[d];
+    }
+    return { kind: 'garmin', api: true, days, activities, pulledAt: obj.pulledAt || null };
+  }
+
   /* ----------------------------------------------------------- таблицы */
   function headerIndex(rows) {
     for (let i = 0; i < Math.min(rows.length, 10); i++) {
@@ -1049,7 +1131,8 @@ const Parsers = (() => {
       if (obj && obj.app === 'health-tracker') return { kind: 'tracker', obj };
       if (obj && obj.app === 'health-plan') return { kind: 'plan', obj };
       if (obj && obj.app === 'health-nutrition') return { kind: 'nutrition', obj };
-      throw new Error('JSON не распознан: ожидается план (plan.json), меню (nutrition.json) или копия трекера (tracker_ГГГГ-ММ-ДД.json)');
+      if (obj && obj.app === 'health-garmin-api') return parseGarminApi(obj);
+      throw new Error('JSON не распознан: ожидается план (plan.json), меню (nutrition.json), копия трекера (tracker_ГГГГ-ММ-ДД.json) или выгрузка Garmin API (garmin_api_ГГГГ-ММ-ДД.json)');
     }
     const { rows } = parseCsv(text);
     const res = parseTable(rows, false);
@@ -1587,11 +1670,12 @@ const Charts = (() => {
   const RULE = { bb: 60, sleep: 70, acwr: 1.3 };
   const HRV_OK = ['IN_RANGE', 'BALANCED'];
   const HRV_LOW = ['BELOW', 'LOW', 'POOR', 'UNBALANCED'];
-  // ACWR для утреннего решения — на конец предыдущего дня (дневное значение Garmin уже включает сегодняшнюю тренировку)
+  // ACWR для утреннего решения — на конец предыдущего дня (значение за день уже включает сегодняшнюю тренировку)
   function verdict(d, prev) {
     if (!d) return null;
     const hs = d.hrvStatus;
-    const acwr = prev && d.t - prev.t === DAY && prev.acwr != null ? prev.acwr : d.acwr;
+    // ACWR собственного расчёта на вечер вчера (enrichDaily); если расчёта нет (начало истории) — значение Garmin
+    const acwr = d.acwrEve != null ? d.acwrEve : prev && d.t - prev.t === DAY && prev.acwr != null ? prev.acwr : d.acwr;
     const conds = [
       { key: 'hrv', label: 'Статус HRV', need: 'в базовом диапазоне',
         ok: hs ? HRV_OK.includes(hs) : null, value: hs ? (RU.hrv[hs] || hs) + (d.hrv ? `, ${f0(d.hrv)} мс` : '') : null, low: HRV_LOW.includes(hs) },
@@ -1614,6 +1698,69 @@ const Charts = (() => {
     return { t: d.t, tone, label, advice, conds, fails, missing, partial: missing > 0 };
   }
   const verdicts = (daily) => daily.map((d, i) => verdict(d, daily[i - 1])).filter(Boolean);
+
+  /* Дополнение дней, пришедших из Garmin API (src\garmin_pull.py). Вызывается в derive() дашборда и приложения.
+     1. HRV: границы базового диапазона ночи (healthStatus) API не отдаёт. Берём последние границы из полного
+        экспорта на дату не позже дня и сравниваем с ними ночное значение. Обновляются с каждым полным экспортом.
+     2. Пульс покоя: в экспорте — среднее за 7 дней; для дней API считаем так же по суточным значениям (≥ 4 из 7).
+     3. ACWR собственного расчёта (acwrCalc — на конец дня, acwrEve — на конец предыдущего дня, для светофора).
+        Нагрузка тренировки (activityTrainingLoad) с затуханием: острая — τ 4 дня × 1,49, хроническая — τ 21 день × 0,35,
+        хроническая не ниже минимума хронической Garmin за дни 30–90 до даты (если данных нет — за последние 60 дней
+        экспорта). Коэффициенты подобраны 08.11.2026 по истории 2025–2026: средняя ошибка 0,12 к ACWR Garmin,
+        порог 1,3 совпадает в 96 % дней. Сводка подбора — notes\2026-11-08_garmin-api.md. */
+  const ACWR_MODEL = { tauA: 4, gA: 1.49, tauC: 21, gC: 0.35 };
+  function enrichDaily(daily, acts) {
+    if (!daily.length) return daily;
+    // 1. HRV
+    let lim = null;
+    for (const d of daily) {
+      if (d.hrvStatus && d.hrvLow != null && d.hrvHigh != null) { lim = { lo: d.hrvLow, hi: d.hrvHigh, at: d.d }; continue; }
+      if (d.hrv != null && !d.hrvStatus && lim) {
+        d.hrvLow = lim.lo; d.hrvHigh = lim.hi; d.hrvLimFrom = lim.at;
+        d.hrvStatus = d.hrv < lim.lo ? 'BELOW' : d.hrv > lim.hi ? 'ABOVE' : 'IN_RANGE';
+      }
+    }
+    // 2. Пульс покоя
+    const rDay = new Map(daily.filter(d => d.rhrDay != null).map(d => [d.t, d.rhrDay]));
+    for (const d of daily) {
+      if (d.rhr != null || d.rhrDay == null) continue;
+      const w = [];
+      for (let i = 0; i < 7; i++) { const v = rDay.get(d.t - i * DAY); if (v != null) w.push(v); }
+      if (w.length >= 4) d.rhr = Math.round(w.reduce((a, b) => a + b, 0) / w.length);
+    }
+    // 3. ACWR
+    const M = ACWR_MODEL, withLoad = acts.filter(a => a.load != null && a.t != null);
+    if (!withLoad.length) return daily;
+    const chr = daily.filter(d => d.loadChronic != null && d.loadChronic > 0);
+    const lastChr = chr.length ? chr.at(-1).t : null;
+    const fallbackFloor = chr.length ? Math.min(...chr.filter(d => d.t > lastChr - 60 * DAY).map(d => d.loadChronic)) : 0;
+    const floorAt = (t) => {
+      const w = chr.filter(d => d.t >= t - 90 * DAY && d.t <= t - 30 * DAY).map(d => d.loadChronic);
+      return w.length ? Math.min(...w) : fallbackFloor;
+    };
+    const t0 = U.dayMs(U.msToDate(withLoad[0].t)), tEnd = daily.at(-1).t;
+    const calc = new Map();
+    let a = 0, c = 0, i = 0, prevEnd = t0;
+    for (let t = t0; t <= tEnd; t += DAY) {
+      const end = t + DAY;
+      a *= Math.exp(-(end - prevEnd) / DAY / M.tauA); c *= Math.exp(-(end - prevEnd) / DAY / M.tauC); prevEnd = end;
+      while (i < withLoad.length && withLoad[i].t < end) {
+        const x = withLoad[i], age = (end - x.t) / DAY;
+        a += x.load * Math.exp(-age / M.tauA); c += x.load * Math.exp(-age / M.tauC); i++;
+      }
+      // первые 28 дней истории хроническая ещё не набрана
+      if (t - t0 >= 28 * DAY) {
+        const cc = Math.max(floorAt(t), M.gC * c);
+        if (cc > 0) calc.set(t, { acute: M.gA * a, chronic: cc, acwr: M.gA * a / cc });
+      }
+    }
+    for (const d of daily) {
+      const k = calc.get(d.t), p = calc.get(d.t - DAY);
+      if (k) { d.loadAcuteCalc = Math.round(k.acute); d.loadChronicCalc = Math.round(k.chronic); d.acwrCalc = Math.round(k.acwr * 100) / 100; }
+      if (p) d.acwrEve = Math.round(p.acwr * 100) / 100;
+    }
+    return daily;
+  }
 
   /* ------------------------------------------------------------ аномальные тренировки */
   // Скорость выше физически правдоподобной для вида — скорее всего, часы писали транспорт.
@@ -1758,10 +1905,16 @@ const Charts = (() => {
       return importNutrition(res.obj);
     }
     if (res.kind === 'garmin') {
-      Object.assign(D.garmin.days, res.days);
+      if (res.api) {
+        // API дополняет день по полям: готовность, статус, VO2max и нагрузка Garmin из полного экспорта сохраняются
+        for (const [d, o] of Object.entries(res.days)) D.garmin.days[d] = { ...(D.garmin.days[d] || {}), ...o };
+      } else {
+        Object.assign(D.garmin.days, res.days);
+      }
       Object.assign(D.garmin.activities, res.activities);
       const ds = Object.keys(res.days).sort();
-      summary = `Garmin: ${ds.length} дн. (${fmtDate(U.dayMs(ds[0]))} — ${fmtDate(U.dayMs(ds[ds.length - 1]))}), активностей: ${Object.keys(res.activities).length}`;
+      if (!ds.length) throw new Error('в файле нет данных по дням');
+      summary = `Garmin${res.api ? ' API' : ''}: ${ds.length} дн. (${fmtDate(U.dayMs(ds[0]))} — ${fmtDate(U.dayMs(ds[ds.length - 1]))}), активностей: ${Object.keys(res.activities).length}`;
       pushFile(D.garmin.files, fileRec(f, 'garmin', summary));
     } else {
       const target = D[res.kind];
@@ -1780,6 +1933,7 @@ const Charts = (() => {
     const daily = Object.keys(D.garmin.days).sort().map(d => ({ d, t: U.dayMs(d), ...D.garmin.days[d] }));
     const actsAll = Object.values(D.garmin.activities).sort((a, b) => a.t - b.t);
     const acts = actsAll.filter(a => !isExcluded(a));
+    enrichDaily(daily, acts);
     const flagged = actsAll.filter(a => anomalyOf(a) || (D.overrides || {})[a.id]);
     const body = Object.values(D.body.rows).sort((a, b) => a.t - b.t);
     const bp = Object.values(D.bp.rows).sort((a, b) => a.t - b.t);
@@ -2059,10 +2213,11 @@ const Charts = (() => {
     const st = lastOf(X.daily, 'stress');
     tile(tiles, { label: 'Стресс, среднее за день', value: f0(st?.stress), unit: 'из 100', sub: sub(st, ''),
       delta: deltaVs(st?.stress, dP.filter(d => d.stress != null).map(d => d.stress), -1), spark: pts(dP, 'stress') });
-    const ld = lastOf(X.daily, 'loadAcute');
-    tile(tiles, { label: 'Острая нагрузка (7 дн.)', value: f0(ld?.loadAcute), unit: '',
-      sub: sub(ld, ld ? `хроническая ${f0(ld.loadChronic)}, соотношение ${RU.acwr[ld.acwrStatus] || '—'}` : ''),
-      delta: deltaVs(ld?.loadAcute, dP.filter(d => d.loadAcute != null).map(d => d.loadAcute), 0), spark: pts(dP, 'loadAcute') });
+    // Нагрузка — собственный расчёт (enrichDaily): нагрузку Garmin API не отдаёт
+    const ld = lastOf(X.daily, 'loadAcuteCalc');
+    tile(tiles, { label: 'Острая нагрузка (расчёт)', value: f0(ld?.loadAcuteCalc), unit: '',
+      sub: sub(ld, ld ? `хроническая ${f0(ld.loadChronicCalc)}, ACWR ${N2.format(ld.acwrCalc)}` : ''),
+      delta: deltaVs(ld?.loadAcuteCalc, dP.filter(d => d.loadAcuteCalc != null).map(d => d.loadAcuteCalc), 0), spark: pts(dP, 'loadAcuteCalc') });
     const w = X.body.at(-1);
     const wd = X.bodyDay.at(-1);
     const wdP = X.bodyDay.filter(d => X.inP(d.t) && d.weightMA != null);
@@ -2217,20 +2372,26 @@ const Charts = (() => {
       lineTable(rS));
 
     const lS = [
-      { label: 'Острая (7 дн.)', color: 'var(--s1)', pts: pts(dP, 'loadAcute'), fmt: f0 },
-      { label: 'Хроническая (28 дн.)', color: 'var(--s2)', pts: pts(dP, 'loadChronic'), fmt: f0 },
+      { label: 'Острая (расчёт)', color: 'var(--s1)', pts: pts(dP, 'loadAcuteCalc'), fmt: f0 },
+      { label: 'Хроническая (расчёт)', color: 'var(--s2)', pts: pts(dP, 'loadChronicCalc'), fmt: f0 },
+      { label: 'Острая Garmin', color: 'var(--s3)', pts: pts(dP, 'loadAcute'), fmt: f0 },
+      { label: 'Хроническая Garmin', color: 'var(--s4)', pts: pts(dP, 'loadChronic'), fmt: f0 },
     ];
     card(g, 'Тренировочная нагрузка', 'Острая выше хронической — нагрузка растёт; сильно выше — риск перегрузки',
       (el) => Charts.line(el, { series: lS, x0, x1, fmt: f0, yZero: true,
-        extra: (t) => { const d = dP.find(q => q.t === t); return d && d.acwr != null ? [{ value: `${N2.format(d.acwr)} (${RU.acwr[d.acwrStatus] || '—'})`, label: 'соотношение' }] : []; } }),
+        extra: (t) => { const d = dP.find(q => q.t === t); return d && d.acwrCalc != null ? [{ value: N2.format(d.acwrCalc), label: 'ACWR (расчёт)' }] : []; } }),
       lineTable(lS));
 
-    // ACWR с зонами. Коридор — по правилу плана (≤ 1,3), а не по статусу Garmin
-    const aS = [{ label: 'ACWR', color: 'var(--s1)', pts: pts(dP, 'acwr'), fmt: (v) => N2.format(v) }];
-    const lastA = lastOf(dP, 'acwr');
-    const zoneOf = (v) => (v < 0.8 ? 'ниже 0,8 — недогруз' : v <= RULE.acwr ? 'коридор плана 0,8–1,3' : v <= 1.5 ? '1,3–1,5 — повышенная' : 'выше 1,5 — риск перегрузки');
+    // ACWR с зонами. Коридор — по правилу плана (≤ 1,3), а не по статусу Garmin.
+    // Основная линия — собственный расчёт (acwrCalc, enrichDaily): он есть и для дней из API; Garmin — для сравнения
+    const aS = [
+      { label: 'ACWR (расчёт)', color: 'var(--s1)', pts: pts(dP, 'acwrCalc'), fmt: (v) => N2.format(v) },
+      { label: 'ACWR Garmin', color: 'var(--s2)', pts: pts(dP, 'acwr'), fmt: (v) => N2.format(v) },
+    ];
+    const lastA = lastOf(dP, 'acwrCalc');
+    const zoneOf = (v) => (v == null ? '—' : v < 0.8 ? 'ниже 0,8 — недогруз' : v <= RULE.acwr ? 'коридор плана 0,8–1,3' : v <= 1.5 ? '1,3–1,5 — повышенная' : 'выше 1,5 — риск перегрузки');
     const aCard = card(g, 'Соотношение острой и хронической нагрузки (ACWR)',
-      lastA ? `Сейчас ${N2.format(lastA.acwr)} (${fmtDate(lastA.t)}): ${zoneOf(lastA.acwr)}` : 'Острая (7 дн.) ÷ хроническая (28 дн.)',
+      lastA ? `Сейчас ${N2.format(lastA.acwrCalc)} (${fmtDate(lastA.t)}): ${zoneOf(lastA.acwrCalc)}` : 'Острая ÷ хроническая нагрузка',
       (el) => Charts.line(el, { series: aS, x0, x1, fmt: (v) => N2.format(v), include: [0.6, 1.6], yZero: true, ticks: 6, height: 230,
         zones: [
           { lo: 0, hi: 0.8, tone: 'none', label: 'недогруз < 0,8' },
@@ -2238,10 +2399,10 @@ const Charts = (() => {
           { lo: RULE.acwr, hi: 1.5, tone: 'warn', label: '1,3–1,5' },
           { lo: 1.5, hi: null, tone: 'crit', label: 'риск перегрузки > 1,5' },
         ],
-        extra: (t) => { const d = dP.find(q => q.t === t); return d ? [{ value: zoneOf(d.acwr), label: '' }, ...(d.acwrStatus ? [{ value: RU.acwr[d.acwrStatus] || d.acwrStatus, label: 'статус Garmin' }] : [])] : []; } }),
-      () => ({ columns: [{ label: 'Дата' }, { label: 'ACWR', num: true }, { label: 'Зона (план)' }, { label: 'Статус Garmin' }],
-        rows: dP.filter(d => d.acwr != null).slice().reverse().map(d => [fmtDate(d.t), N2.format(d.acwr), zoneOf(d.acwr), RU.acwr[d.acwrStatus] || d.acwrStatus]) }));
-    aCard.card.querySelector('.card-sub').after(h('p', 'card-sub', 'Garmin считает оптимумом до 1,5, план — до 1,3; зоны на графике по плану.'));
+        extra: (t) => { const d = dP.find(q => q.t === t); return d ? [{ value: zoneOf(d.acwrCalc), label: '' }, ...(d.acwrStatus ? [{ value: RU.acwr[d.acwrStatus] || d.acwrStatus, label: 'статус Garmin' }] : [])] : []; } }),
+      () => ({ columns: [{ label: 'Дата' }, { label: 'ACWR расчёт', num: true }, { label: 'Зона (план)' }, { label: 'ACWR Garmin', num: true }, { label: 'Статус Garmin' }],
+        rows: dP.filter(d => d.acwrCalc != null || d.acwr != null).slice().reverse().map(d => [fmtDate(d.t), d.acwrCalc != null ? N2.format(d.acwrCalc) : '—', zoneOf(d.acwrCalc), d.acwr != null ? N2.format(d.acwr) : '—', RU.acwr[d.acwrStatus] || d.acwrStatus || '—']) }));
+    aCard.card.querySelector('.card-sub').after(h('p', 'card-sub', 'Светофор берёт расчёт: Garmin не отдаёт ACWR через API. Расчёт по нагрузке тренировок воспроизводит ACWR Garmin со средней ошибкой 0,12. Garmin считает оптимумом до 1,5, план — до 1,3; зоны на графике по плану.'));
 
     // Активности по неделям, минут
     const long = state.period === 'all' && actsP.length && (actsP.at(-1).t - actsP[0].t) / DAY > 840;
@@ -2764,8 +2925,8 @@ const Charts = (() => {
     L.push('');
     L.push('```csv');
     const vByT = new Map(verdicts(X.daily).map(q => [q.t, q]));
-    const dcols = ['date', 'rule_verdict', 'readiness', 'readiness_level', 'hrv', 'hrv_status', 'hrv_base_low', 'hrv_base_high', 'sleep_score', 'sleep_min', 'deep_min', 'rem_min', 'rhr', 'bb_max', 'bb_min', 'stress', 'steps', 'load_acute', 'load_chronic', 'acwr', 'acwr_status', 'training_status', 'vo2max', 'fitness_age', 'spo2', 'respiration'];
-    const dkeys = ['d', 'readiness', 'readinessLevel', 'hrv', 'hrvStatus', 'hrvLow', 'hrvHigh', 'sleepScore', 'sleepMin', 'deepMin', 'remMin', 'rhr', 'bbMax', 'bbMin', 'stress', 'steps', 'loadAcute', 'loadChronic', 'acwr', 'acwrStatus', 'trainingStatus', 'vo2', 'fitAge', 'spo2', 'resp'];
+    const dcols = ['date', 'rule_verdict', 'readiness', 'readiness_level', 'hrv', 'hrv_status', 'hrv_base_low', 'hrv_base_high', 'sleep_score', 'sleep_min', 'deep_min', 'rem_min', 'rhr', 'bb_max', 'bb_min', 'stress', 'steps', 'load_acute', 'load_chronic', 'acwr', 'acwr_status', 'acwr_calc', 'acwr_calc_eve', 'training_status', 'vo2max', 'fitness_age', 'spo2', 'respiration'];
+    const dkeys = ['d', 'readiness', 'readinessLevel', 'hrv', 'hrvStatus', 'hrvLow', 'hrvHigh', 'sleepScore', 'sleepMin', 'deepMin', 'remMin', 'rhr', 'bbMax', 'bbMin', 'stress', 'steps', 'loadAcute', 'loadChronic', 'acwr', 'acwrStatus', 'acwrCalc', 'acwrEve', 'trainingStatus', 'vo2', 'fitAge', 'spo2', 'resp'];
     const vCode = { good: 'green', warn: 'yellow', crit: 'red' };
     L.push(csv(dcols, X.daily.map(r => { const q = vByT.get(r.t); return [r.d, q ? vCode[q.tone] + (q.partial ? '_partial' : '') : null, ...dkeys.slice(1).map(k => (typeof r[k] === 'number' ? +r[k].toFixed(2) : r[k]))]; })));
     L.push('```');
@@ -4750,7 +4911,7 @@ const Charts = (() => {
     /* ---------------- версия сайта */
     // build.py подставляет в BUILD дату и время сборки и кладёт то же значение в web/version.json.
     // В исходнике dashboard.html метка остаётся как есть — показываем «исходник».
-    const BUILD = '2026-11-07 13:05';
+    const BUILD = '2026-11-08 22:48';
     const isBuilt = !BUILD.startsWith('__');
     const buildLabel = isBuilt ? BUILD : 'исходник';
     const verUrl = /\/app\/?(index\.html)?$/.test(location.pathname) ? '../version.json' : 'version.json';

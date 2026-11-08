@@ -409,11 +409,12 @@ const U = {
   const RULE = { bb: 60, sleep: 70, acwr: 1.3 };
   const HRV_OK = ['IN_RANGE', 'BALANCED'];
   const HRV_LOW = ['BELOW', 'LOW', 'POOR', 'UNBALANCED'];
-  // ACWR для утреннего решения — на конец предыдущего дня (дневное значение Garmin уже включает сегодняшнюю тренировку)
+  // ACWR для утреннего решения — на конец предыдущего дня (значение за день уже включает сегодняшнюю тренировку)
   function verdict(d, prev) {
     if (!d) return null;
     const hs = d.hrvStatus;
-    const acwr = prev && d.t - prev.t === DAY && prev.acwr != null ? prev.acwr : d.acwr;
+    // ACWR собственного расчёта на вечер вчера (enrichDaily); если расчёта нет (начало истории) — значение Garmin
+    const acwr = d.acwrEve != null ? d.acwrEve : prev && d.t - prev.t === DAY && prev.acwr != null ? prev.acwr : d.acwr;
     const conds = [
       { key: 'hrv', label: 'Статус HRV', need: 'в базовом диапазоне',
         ok: hs ? HRV_OK.includes(hs) : null, value: hs ? (RU.hrv[hs] || hs) + (d.hrv ? `, ${f0(d.hrv)} мс` : '') : null, low: HRV_LOW.includes(hs) },
@@ -436,6 +437,69 @@ const U = {
     return { t: d.t, tone, label, advice, conds, fails, missing, partial: missing > 0 };
   }
   const verdicts = (daily) => daily.map((d, i) => verdict(d, daily[i - 1])).filter(Boolean);
+
+  /* Дополнение дней, пришедших из Garmin API (src\garmin_pull.py). Вызывается в derive() дашборда и приложения.
+     1. HRV: границы базового диапазона ночи (healthStatus) API не отдаёт. Берём последние границы из полного
+        экспорта на дату не позже дня и сравниваем с ними ночное значение. Обновляются с каждым полным экспортом.
+     2. Пульс покоя: в экспорте — среднее за 7 дней; для дней API считаем так же по суточным значениям (≥ 4 из 7).
+     3. ACWR собственного расчёта (acwrCalc — на конец дня, acwrEve — на конец предыдущего дня, для светофора).
+        Нагрузка тренировки (activityTrainingLoad) с затуханием: острая — τ 4 дня × 1,49, хроническая — τ 21 день × 0,35,
+        хроническая не ниже минимума хронической Garmin за дни 30–90 до даты (если данных нет — за последние 60 дней
+        экспорта). Коэффициенты подобраны 08.11.2026 по истории 2025–2026: средняя ошибка 0,12 к ACWR Garmin,
+        порог 1,3 совпадает в 96 % дней. Сводка подбора — notes\2026-11-08_garmin-api.md. */
+  const ACWR_MODEL = { tauA: 4, gA: 1.49, tauC: 21, gC: 0.35 };
+  function enrichDaily(daily, acts) {
+    if (!daily.length) return daily;
+    // 1. HRV
+    let lim = null;
+    for (const d of daily) {
+      if (d.hrvStatus && d.hrvLow != null && d.hrvHigh != null) { lim = { lo: d.hrvLow, hi: d.hrvHigh, at: d.d }; continue; }
+      if (d.hrv != null && !d.hrvStatus && lim) {
+        d.hrvLow = lim.lo; d.hrvHigh = lim.hi; d.hrvLimFrom = lim.at;
+        d.hrvStatus = d.hrv < lim.lo ? 'BELOW' : d.hrv > lim.hi ? 'ABOVE' : 'IN_RANGE';
+      }
+    }
+    // 2. Пульс покоя
+    const rDay = new Map(daily.filter(d => d.rhrDay != null).map(d => [d.t, d.rhrDay]));
+    for (const d of daily) {
+      if (d.rhr != null || d.rhrDay == null) continue;
+      const w = [];
+      for (let i = 0; i < 7; i++) { const v = rDay.get(d.t - i * DAY); if (v != null) w.push(v); }
+      if (w.length >= 4) d.rhr = Math.round(w.reduce((a, b) => a + b, 0) / w.length);
+    }
+    // 3. ACWR
+    const M = ACWR_MODEL, withLoad = acts.filter(a => a.load != null && a.t != null);
+    if (!withLoad.length) return daily;
+    const chr = daily.filter(d => d.loadChronic != null && d.loadChronic > 0);
+    const lastChr = chr.length ? chr.at(-1).t : null;
+    const fallbackFloor = chr.length ? Math.min(...chr.filter(d => d.t > lastChr - 60 * DAY).map(d => d.loadChronic)) : 0;
+    const floorAt = (t) => {
+      const w = chr.filter(d => d.t >= t - 90 * DAY && d.t <= t - 30 * DAY).map(d => d.loadChronic);
+      return w.length ? Math.min(...w) : fallbackFloor;
+    };
+    const t0 = U.dayMs(U.msToDate(withLoad[0].t)), tEnd = daily.at(-1).t;
+    const calc = new Map();
+    let a = 0, c = 0, i = 0, prevEnd = t0;
+    for (let t = t0; t <= tEnd; t += DAY) {
+      const end = t + DAY;
+      a *= Math.exp(-(end - prevEnd) / DAY / M.tauA); c *= Math.exp(-(end - prevEnd) / DAY / M.tauC); prevEnd = end;
+      while (i < withLoad.length && withLoad[i].t < end) {
+        const x = withLoad[i], age = (end - x.t) / DAY;
+        a += x.load * Math.exp(-age / M.tauA); c += x.load * Math.exp(-age / M.tauC); i++;
+      }
+      // первые 28 дней истории хроническая ещё не набрана
+      if (t - t0 >= 28 * DAY) {
+        const cc = Math.max(floorAt(t), M.gC * c);
+        if (cc > 0) calc.set(t, { acute: M.gA * a, chronic: cc, acwr: M.gA * a / cc });
+      }
+    }
+    for (const d of daily) {
+      const k = calc.get(d.t), p = calc.get(d.t - DAY);
+      if (k) { d.loadAcuteCalc = Math.round(k.acute); d.loadChronicCalc = Math.round(k.chronic); d.acwrCalc = Math.round(k.acwr * 100) / 100; }
+      if (p) d.acwrEve = Math.round(p.acwr * 100) / 100;
+    }
+    return daily;
+  }
 
   /* ------------------------------------------------------------ аномальные тренировки */
   // Скорость выше физически правдоподобной для вида — скорее всего, часы писали транспорт.
@@ -1615,7 +1679,7 @@ const U = {
     /* ---------------- версия сайта */
     // build.py подставляет в BUILD дату и время сборки и кладёт то же значение в web/version.json.
     // В исходнике dashboard.html метка остаётся как есть — показываем «исходник».
-    const BUILD = '2026-11-07 13:05';
+    const BUILD = '2026-11-08 22:48';
     const isBuilt = !BUILD.startsWith('__');
     const buildLabel = isBuilt ? BUILD : 'исходник';
     const verUrl = /\/app\/?(index\.html)?$/.test(location.pathname) ? '../version.json' : 'version.json';
@@ -1672,6 +1736,7 @@ const U = {
     const D = state.data;
     const daily = Object.keys(D.garmin.days).sort().map(d => ({ d, t: U.dayMs(d), ...D.garmin.days[d] }));
     const acts = Object.values(D.garmin.activities).filter(a => !isExcluded(a)).sort((a, b) => a.t - b.t);
+    enrichDaily(daily, acts);
     return { daily, acts };
   }
   const curWeek = () => Math.max(0, Math.min(TR.weeks - 1, Math.floor((todayMs() - trStart()) / (7 * DAY))));
