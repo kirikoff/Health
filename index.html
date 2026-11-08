@@ -468,6 +468,7 @@ footer.foot { color: var(--muted); font-size: 12px; padding: 24px max(16px, calc
     <button type="button" role="radio" data-p="all">Всё</button>
   </div>
   <div class="actions">
+    <button type="button" id="btn-garmin-dir" class="btn" hidden>Папка Garmin API</button>
     <button type="button" id="btn-load" class="btn primary">Загрузить выгрузки</button>
     <button type="button" id="btn-export" class="btn">Данные для Claude</button>
     <button type="button" id="btn-theme" class="btn icon" aria-label="Переключить тему">◐</button>
@@ -4911,7 +4912,7 @@ const Charts = (() => {
     /* ---------------- версия сайта */
     // build.py подставляет в BUILD дату и время сборки и кладёт то же значение в web/version.json.
     // В исходнике dashboard.html метка остаётся как есть — показываем «исходник».
-    const BUILD = '2026-11-08 22:48';
+    const BUILD = '2026-11-08 23:13';
     const isBuilt = !BUILD.startsWith('__');
     const buildLabel = isBuilt ? BUILD : 'исходник';
     const verUrl = /\/app\/?(index\.html)?$/.test(location.pathname) ? '../version.json' : 'version.json';
@@ -4952,6 +4953,93 @@ const Charts = (() => {
     return { enabled, start, buildLabel, changed, syncNow, signIn, signOut, state: st, mergeTracker, mergeData, signedIn, isAdmin, ui, accountBox, loginForm, putPlan, readTracker, togglePanel };
   })();
 /*@end:sync*/
+
+  /* ------------------------------------------------------------ автозагрузка файла Garmin API */
+  // Chrome / Edge на компьютере: дашборд один раз получает доступ к папке raw\garmin\api (File System Access API),
+  // хранит ссылку на неё в IndexedDB (база health-fs, не данные — данные по-прежнему в health-dashboard-v1 и Firebase)
+  // и при открытии и возврате на вкладку загружает самый свежий garmin_api_ГГГГ-ММ-ДД.json, если он ещё не загружен
+  // (сверка по имени и размеру со списком загруженных файлов). Только у администратора: у других нет данных Garmin.
+  const GarminDir = (() => {
+    const btn = document.getElementById('btn-garmin-dir');
+    const supported = typeof window.showDirectoryPicker === 'function' && !U.who;
+    const RE = /^garmin_api_\d{4}-\d{2}-\d{2}\.json$/;
+    let handle = null, busy = false;
+    const idb = (mode, fn) => new Promise((res, rej) => {
+      const rq = indexedDB.open('health-fs', 1);
+      rq.onupgradeneeded = () => rq.result.createObjectStore('handles');
+      rq.onerror = () => rej(rq.error);
+      rq.onsuccess = () => {
+        const tx = rq.result.transaction('handles', mode), st = tx.objectStore('handles');
+        const r = fn(st);
+        tx.oncomplete = () => { res(r && 'result' in r ? r.result : undefined); rq.result.close(); };
+        tx.onerror = () => rej(tx.error);
+      };
+    });
+    const getH = () => idb('readonly', (st) => st.get('garmin-api')).catch(() => null);
+    const putH = (h0) => idb('readwrite', (st) => st.put(h0, 'garmin-api'));
+    async function perm(ask) {
+      if (!handle) return 'none';
+      try {
+        let p = await handle.queryPermission({ mode: 'read' });
+        if (p === 'prompt' && ask) p = await handle.requestPermission({ mode: 'read' });
+        return p;
+      } catch (e) { return 'denied'; }
+    }
+    function ui(p, info) {
+      if (!supported) return;
+      btn.hidden = false;
+      btn.classList.toggle('primary', p === 'prompt' || p === 'denied');
+      btn.textContent = p === 'granted' ? 'Garmin API ⟳' : p === 'none' ? 'Папка Garmin API' : 'Разрешить папку Garmin API';
+      btn.title = p === 'granted'
+        ? `Папка «${handle.name}» подключена: свежий garmin_api_*.json загружается при открытии. ${info || ''} Нажмите, чтобы проверить сейчас.`
+        : p === 'none' ? 'Выберите папку D:\\AI\\Health\\raw\\garmin\\api — дальше свежий файл будет загружаться сам'
+        : 'Браузер просит подтвердить доступ к папке Garmin API — нажмите';
+    }
+    async function latest() {
+      let best = null;
+      for await (const e of handle.values()) if (e.kind === 'file' && RE.test(e.name) && (!best || e.name > best.name)) best = e;
+      return best ? best.getFile() : null;
+    }
+    // ждём первую синхронизацию, чтобы не перезаписать облачные данные старыми локальными
+    async function syncIdle() {
+      for (let i = 0; i < 40 && Sync.enabled && Sync.signedIn() && (Sync.state.busy || !Sync.state.lastSync); i++) await new Promise(r => setTimeout(r, 500));
+    }
+    async function check(ask) {
+      if (!supported || busy) return;
+      busy = true;
+      try {
+        if (!handle) handle = await getH();
+        const p = await perm(ask);
+        if (p !== 'granted') { ui(p); return; }
+        await syncIdle();
+        const f = await latest();
+        if (!f) { ui(p, 'Файлов garmin_api_*.json в папке нет.'); return; }
+        const done = (state.data.garmin.files || []).some(x => x.name === f.name && x.size === f.size);
+        ui(p, `Последний файл: ${f.name}${done ? ', уже загружен' : ''}.`);
+        if (!done) await handleFiles([f]);
+      } catch (e) { console.warn('Папка Garmin API', e); ui('denied'); }
+      finally { busy = false; }
+    }
+    async function pick() {
+      try {
+        const h0 = await window.showDirectoryPicker({ id: 'garmin-api', mode: 'read' });
+        handle = h0; await putH(h0);
+        await check(true);
+      } catch (e) { if (e.name !== 'AbortError') console.warn('Папка Garmin API', e); }
+    }
+    function start() {
+      if (!supported) return;
+      btn.onclick = async () => {
+        if (!handle) handle = await getH();
+        if (!handle) return pick();
+        const p = await perm(true);
+        if (p === 'granted') check(false); else pick();
+      };
+      check(false);
+      document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') check(false); });
+    }
+    return { start };
+  })();
 
   /* ------------------------------------------------------------ управление */
   function setupControls() {
@@ -5034,6 +5122,7 @@ const Charts = (() => {
   window.addEventListener('load', () => setTimeout(() => window.scrollTo(0, 0), 0));
   document.getElementById('ver').textContent = `версия ${Sync.buildLabel}`;
   Sync.start();
+  GarminDir.start();
 })();
 
 </script>
