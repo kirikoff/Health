@@ -804,17 +804,67 @@ const U = {
     const d = state.data.garmin.days[date];
     return { acts, steps: d && d.steps != null ? d.steps : null };
   }
-  // Сопоставление: каждой сессии дня — первая подходящая по виду тренировка Garmin
+  // Сопоставление тренировок плана с тренировками Garmin за день (с 08.11.2026 — строже, чем просто по виду):
+  // силовая, сквош — вид Garmin из KIND; восстановление — плавание; зона 2 — кардио от 25 мин со средним пульсом
+  // в зоне своей недели (как «факт по плану»), плавание засчитывается в зону 2 только тренировке «Плавание» (шаблон swim:
+  // зона 2 по усилию, пульс в воде не используем). Сначала сопоставляются самые однозначные виды.
+  const SWIM_TYPES = ['lap_swimming', 'open_water_swimming', 'swimming'];
+  function fitsSession(s, a) {
+    if (s.kind === 'recovery') return SWIM_TYPES.includes(a.type);
+    if (s.kind === 'zone2') {
+      if (SWIM_TYPES.includes(a.type)) return s.tpl === 'swim';
+      if (!KIND.zone2.garmin.includes(a.type) || (a.durMin || 0) < 25 || a.avgHr == null) return false;
+      const z = zone2At(a.t);
+      return !!z && z[1] > 0 && a.avgHr >= z[0] && a.avgHr <= z[1];
+    }
+    return (KIND[s.kind] || KIND.other).garmin.includes(a.type);
+  }
+  const fitRank = (s) => (s.kind === 'strength' || s.kind === 'squash' ? 0 : s.kind === 'recovery' || (s.kind === 'zone2' && s.tpl === 'swim') ? 1 : 2);
   function matchDay(X, date) {
     const { acts } = garminDay(noGarmin ? null : X, date);
     const used = new Set(), map = {};
-    const ss = Object.values(TR.sessions).filter(s => s.date === date);
+    const ss = Object.values(TR.sessions).filter(s => s.date === date).sort((a, b) => fitRank(a) - fitRank(b));
     for (const s of ss) {
-      const types = (KIND[s.kind] || KIND.other).garmin;
-      const a = acts.find(x => !used.has(x.id) && types.includes(x.type));
+      const a = acts.find(x => !used.has(x.id) && fitsSession(s, x));
       if (a) { used.add(a.id); map[s.id] = a; }
     }
     return { map, extra: acts.filter(a => !used.has(a.id)) };
+  }
+
+  /* Закрытие дня по факту Garmin (решение 08.11.2026): когда день прошёл и по Garmin есть данные за более поздний день,
+     тренировки плана без отметки становятся «выполнено» (нашлась подходящая тренировка) или «пропущено» (не нашлась).
+     - Ручная отметка побеждает: размеченное вручную не трогается; снятая вручную отметка (надгробие l:) не возвращается.
+     - Не закрываются: зарядка, контроль, другое (часы их не пишут), тренировки вне плана; «по желанию» — только «выполнено».
+     - Отметка с флагом auto и временем начала дня тренировки: любая ручная отметка новее и побеждает при синхронизации.
+       «Пропущено» ставится на 00:00:00, «выполнено» — на 00:00:01: если тренировка пришла в Garmin позже, авто-пропуск
+       сменится на «выполнено» и победит при слиянии.
+     - Задним числом — с начала трекера. Не работает при просмотре чужого трекера и без данных Garmin. */
+  const AUTO_KINDS = new Set(['strength', 'squash', 'zone2', 'recovery']);
+  function autoCloseDays(X) {
+    if (noGarmin || TRV || !X || !hasTracker()) return 0;
+    let last = null;
+    for (const d of Object.keys(state.data.garmin.days || {})) if (!last || d > last) last = d;
+    if (!last) return 0;
+    const today = iso(todayMs()), tombs = TR.tomb || {};
+    const open = (s) => {
+      if (s.extra || !AUTO_KINDS.has(s.kind) || s.date >= today || s.date >= last || (TR.start && s.date < TR.start)) return false;
+      const l = TR.log[s.id];
+      if (!l) return !tombs['l:' + s.id];
+      return l.auto === true && l.st === 'skipped' && !l.joker && !l.note;   // авто-пропуск ещё может стать «выполнено»
+    };
+    const dates = new Set(Object.values(TR.sessions).filter(open).map(s => s.date));
+    let n = 0;
+    for (const date of dates) {
+      const { map } = matchDay(X, date);
+      for (const s of Object.values(TR.sessions)) {
+        if (s.date !== date || !open(s)) continue;
+        const a = map[s.id];
+        if (!a && (s.optional || TR.log[s.id])) continue;
+        TR.log[s.id] = a ? { st: 'done', at: `${date}T00:00:01.000Z`, auto: true, garmin: a.id, note: '' } : { st: 'skipped', at: `${date}T00:00:00.000Z`, auto: true, note: '' };
+        n++;
+      }
+    }
+    return n;
   }
 
   // Статистика недели
@@ -1679,7 +1729,7 @@ const U = {
     /* ---------------- версия сайта */
     // build.py подставляет в BUILD дату и время сборки и кладёт то же значение в web/version.json.
     // В исходнике dashboard.html метка остаётся как есть — показываем «исходник».
-    const BUILD = '2026-11-08 23:13';
+    const BUILD = '2026-11-08 23:29';
     const isBuilt = !BUILD.startsWith('__');
     const buildLabel = isBuilt ? BUILD : 'исходник';
     const verUrl = /\/app\/?(index\.html)?$/.test(location.pathname) ? '../version.json' : 'version.json';
@@ -1743,7 +1793,7 @@ const U = {
   const vMap = () => new Map(verdicts(X.daily).map(q => [iso(q.t), q]));
   const logOf = (id) => TR.log[id] || null;
   const toneOf = (l) => (!l ? null : l.joker ? 'warn' : ST[l.st].tone);
-  const pillText = (l) => (l.joker ? 'джокер' : ST[l.st].short);
+  const pillText = (l) => (l.joker ? 'джокер' : ST[l.st].short + (l.auto ? ' · Garmin' : ''));
 
   function toast(title, sub) {
     const box = document.getElementById('toasts');
@@ -1765,7 +1815,7 @@ const U = {
     const bf = earned();
     const prev = TR.log[sid] || {};
     if (prev.st === st && !prev.joker) return;
-    TR.log[sid] = { ...prev, st, joker: false, at: new Date().toISOString() };
+    TR.log[sid] = { ...prev, st, joker: false, auto: false, at: new Date().toISOString() };
     commit(bf);
   }
   function clearMark(sid) { const bf = earned(); delete TR.log[sid]; tomb('l:' + sid); commit(bf); }
@@ -1788,6 +1838,7 @@ const U = {
   /* ---------------------------------------------------------------- отрисовка */
   function render() {
     X = derive();
+    if (autoCloseDays(X)) trSave();   // закрытие прошедших дней по факту Garmin
     view.replaceChildren();
     document.querySelectorAll('.tab').forEach(b => { if (b.dataset.tab === nav.tab) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current'); });
     const sub = nav.sid || nav.add;
@@ -2051,7 +2102,7 @@ const U = {
         const left = jokersLeft(s.date.slice(0, 7));
         const jb = h('button', 'linkbtn', l.joker ? 'Снять джокер' : left ? 'Закрыть джокером (1 в месяц)' : 'Джокер этого месяца уже использован'); jb.type = 'button';
         jb.disabled = !l.joker && !left;
-        jb.onclick = () => { const bf = earned(); TR.log[s.id] = { ...l, joker: !l.joker, at: new Date().toISOString() }; commit(bf); };
+        jb.onclick = () => { const bf = earned(); TR.log[s.id] = { ...l, joker: !l.joker, auto: false, at: new Date().toISOString() }; commit(bf); };
         row.appendChild(jb);
       }
       row.appendChild(h('span', 'grow'));
